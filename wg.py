@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+import signal
 import atexit
 from pathlib import Path
 
@@ -18,15 +20,6 @@ SERVER_PORT = 51820
 # === Init ===
 os.makedirs(CLIENT_DIR, exist_ok=True)
 
-# === Cleanup on Exit ===
-def cleanup():
-    print("🧼 Cleaning up: Bringing interface down...")
-    subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE],
-                   stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
-
-atexit.register(cleanup)
-
 # === Utility Functions ===
 def run(cmd):
     return subprocess.check_output(cmd, shell=True).decode().strip()
@@ -36,9 +29,9 @@ def get_public_ip():
 
 def detect_outbound_interface():
     try:
-        return run("ip route get 1.1.1.1 | awk '{print $5}'").strip()
+        return run("ip route get 1.1.1.1 | awk '{print $5}'")
     except:
-        return "eth0"  # fallback
+        return "eth0"
 
 def get_server_keys():
     try:
@@ -69,7 +62,7 @@ def generate_keys():
 
 def ensure_server_config():
     if not Path(WG_CONFIG).exists():
-        print("⚙️ Creating wg0.conf since it doesn't exist...")
+        print("⚙️ Creating wg0.conf...")
         server_priv, _ = get_server_keys()
         interface = detect_outbound_interface()
 
@@ -81,9 +74,37 @@ PostDown = iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE; iptables
 ListenPort = {SERVER_PORT}
 PrivateKey = {server_priv}
 """
-
         Path(WG_CONFIG).write_text(config)
-        print("✅ Server config created at wg0.conf")
+        print("✅ Server config created.")
+
+def is_interface_up():
+    try:
+        output = run(f"sudo wg show {WG_INTERFACE}")
+        return "interface: " in output
+    except:
+        return False
+
+def keep_interface_up():
+    if not is_interface_up():
+        print(f"🚀 Bringing up {WG_INTERFACE}...")
+        subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
+    else:
+        print(f"🔄 Interface {WG_INTERFACE} already up.")
+
+    print("⏳ VPN is active. Press Ctrl+C to terminate and bring down the interface...")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Caught termination signal.")
+
+# === Cleanup on Exit ===
+def cleanup():
+    print("\n🧼 Cleaning up: Bringing interface down...")
+    subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE])
+    print("✅ Interface brought down. Exiting.")
+
+atexit.register(cleanup)
 
 # === Client Management ===
 def generate_client(client_name):
@@ -107,6 +128,10 @@ AllowedIPs = {client_ip}/32
     with open(WG_CONFIG, "a") as f:
         f.write(peer_block)
 
+    # Apply without restarting
+    print("🔄 Reloading WireGuard config dynamically...")
+    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, WG_CONFIG])
+
     # Client config
     client_config = f"""
 [Interface]
@@ -122,9 +147,6 @@ PersistentKeepalive = 25
 """
     client_path = Path(CLIENT_DIR) / f"{client_name}.conf"
     client_path.write_text(client_config.strip())
-
-    print("🔄 Restarting WireGuard...")
-    subprocess.run(["sudo", "systemctl", "restart", f"wg-quick@{WG_INTERFACE}"])
 
     print("📱 WireGuard Mobile QR Code:")
     subprocess.run(f"qrencode -t ansiutf8 < {client_path}", shell=True)
@@ -147,8 +169,8 @@ def remove_client(client_name):
                 continue
             f.write(line)
 
-    print("🔁 Restarting WireGuard...")
-    subprocess.run(["sudo", "systemctl", "restart", f"wg-quick@{WG_INTERFACE}"])
+    print("🔄 Reloading WireGuard config dynamically...")
+    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, WG_CONFIG])
 
     client_path = Path(CLIENT_DIR) / f"{client_name}.conf"
     if client_path.exists():
@@ -170,6 +192,7 @@ if __name__ == "__main__":
 
     if action == "add":
         generate_client(client_name)
+        keep_interface_up()
     elif action == "remove":
         remove_client(client_name)
     else:
