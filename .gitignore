@@ -1,3 +1,4 @@
 *.conf
 clients/
 *.log
+*.key
