@@ -17,7 +17,6 @@ WG_CONFIG = f"{WG_DIR}/{WG_INTERFACE}.conf"
 SUBNET_PREFIX = "10.0.0"
 SERVER_PORT = 51820
 
-# === Init ===
 os.makedirs(CLIENT_DIR, exist_ok=True)
 
 # === Utility Functions ===
@@ -98,7 +97,6 @@ def keep_interface_up():
     except KeyboardInterrupt:
         print("\n🛑 Caught termination signal.")
 
-# === Cleanup on Exit ===
 def cleanup():
     print("\n🧼 Cleaning up: Bringing interface down...")
     subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE])
@@ -179,21 +177,40 @@ def remove_client(client_name):
 
     print(f"✅ Client {client_name} removed.")
 
-# === Entry Point ===
+# === Interactive CLI ===
+def main():
+    ensure_server_config()
+    keep_interface_up()
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage:")
-        print("  sudo python3 wg.py add <client-name>")
-        print("  sudo python3 wg.py remove <client-name>")
-        sys.exit(1)
+    try:
+        print("📡 WireGuard Client Manager")
+        print("===========================")
+        print("1. Add new client")
+        print("2. Remove existing client")
+        print("3. Exit")
+        choice = input("Select an option: ").strip()
 
-    action = sys.argv[1]
-    client_name = sys.argv[2]
+        if choice == "1":
+            client_name = input("Enter client name: ").strip()
+            if not client_name:
+                print("❌ Client name is required.")
+                sys.exit(1)
+            generate_client(client_name)
+            main()
+        elif choice == "2":
+            client_name = input("Enter client name to remove: ").strip()
+            if not client_name:
+                print("❌ Client name is required.")
+                sys.exit(1)
+            remove_client(client_name)
+            main()
+        elif choice == "3":
+            print("👋 Exiting.")
+            sys.exit(0)
+        else:
+            print("❌ Invalid option.")
+            sys.exit(1)
 
-    if action == "add":
-        generate_client(client_name)
-        keep_interface_up()
-    elif action == "remove":
-        remove_client(client_name)
-    else:
-        print("❌ Invalid action. Use 'add' or 'remove'.")
+    except KeyboardInterrupt:
+        cleanup()
