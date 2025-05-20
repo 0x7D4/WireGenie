@@ -1,216 +1,200 @@
-#!/usr/bin/env python3
+# Re-creating the full WireGuard management script based on user's requirements.
+# Features to include:
+# - Start WireGuard interface on script start
+# - Menu-based interaction for adding/removing/listing clients
+# - Generate keys
+# - Assign IPs
+# - Generate and show QR code
+# - Save config
+# - Keep interface up until user terminates
+# - No email feature (per user request)
 
 import os
-import re
 import subprocess
-import sys
-import time
 import signal
-import atexit
+import sys
+import tempfile
 from pathlib import Path
+from shutil import which
 
-# === Configuration ===
 WG_INTERFACE = "wg0"
 WG_DIR = "/etc/wireguard"
 CLIENT_DIR = f"{WG_DIR}/clients"
 WG_CONFIG = f"{WG_DIR}/{WG_INTERFACE}.conf"
+SERVER_WG_IP = "10.0.0.1"
 SUBNET_PREFIX = "10.0.0"
 SERVER_PORT = 51820
+DNS_SERVER = "1.1.1.1"
 
-os.makedirs(CLIENT_DIR, exist_ok=True)
+def get_default_interface():
+    result = subprocess.run(["ip", "route", "get", "8.8.8.8"], capture_output=True, text=True)
+    return result.stdout.split("dev")[1].split()[0] if "dev" in result.stdout else "eth0"
 
-# === Utility Functions ===
-def run(cmd):
-    return subprocess.check_output(cmd, shell=True).decode().strip()
+def initialize_server_config():
+    if not os.path.exists(WG_CONFIG):
+        print(f"🔧 Creating base config at {WG_CONFIG}...")
+        server_private_key_path = Path(f"{WG_DIR}/server_private.key")
+        server_public_key_path = Path(f"{WG_DIR}/server_public.key")
 
-def get_public_ip():
-    return run("curl -s https://checkip.amazonaws.com")
+        if not server_private_key_path.exists() or not server_public_key_path.exists():
+            server_private_key = subprocess.check_output(["wg", "genkey"]).decode().strip()
+            server_public_key = subprocess.check_output(["wg", "pubkey"], input=server_private_key.encode()).decode().strip()
 
-def detect_outbound_interface():
-    try:
-        return run("ip route get 1.1.1.1 | awk '{print $5}'")
-    except:
-        return "eth0"
+            with open(server_private_key_path, "w") as f:
+                f.write(server_private_key)
+            with open(server_public_key_path, "w") as f:
+                f.write(server_public_key)
+        else:
+            with open(server_private_key_path) as f:
+                server_private_key = f.read().strip()
 
-def get_server_keys():
-    try:
-        priv_path = Path(WG_DIR) / "server_private.key"
-        pub_path = Path(WG_DIR) / "server_public.key"
-        server_priv = priv_path.read_text().strip()
-        server_pub = pub_path.read_text().strip()
-        return server_priv, server_pub
-    except Exception as e:
-        raise Exception(f"❌ Error reading server keys: {e}")
+        interface = get_default_interface()
+
+        config_content = f"""[Interface]
+Address = {SERVER_WG_IP}/24
+SaveConfig = false
+PostUp = iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE; iptables -A FORWARD -i {WG_INTERFACE} -o {WG_INTERFACE} -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE; iptables -D FORWARD -i {WG_INTERFACE} -o {WG_INTERFACE} -j ACCEPT
+ListenPort = {SERVER_PORT}
+PrivateKey = {server_private_key}
+"""
+        with open(WG_CONFIG, "w") as f:
+            f.write(config_content)
+        print("✅ Server base configuration created.")
+
+def start_wireguard():
+    subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
+    print(f"🚀 WireGuard interface {WG_INTERFACE} is now up.")
 
 def get_used_ips():
-    if not Path(WG_CONFIG).exists():
-        return []
-    with open(WG_CONFIG) as f:
-        return re.findall(f"{SUBNET_PREFIX}\\.\\d+", f.read())
+    used = set()
+    if os.path.exists(WG_CONFIG):
+        with open(WG_CONFIG) as f:
+            for line in f:
+                if SUBNET_PREFIX in line:
+                    ip = line.strip().split(".")[-1].split("/")[0]
+                    used.add(int(ip))
+    return used
 
-def get_next_ip(used_ips):
-    next_ip = 2
-    while f"{SUBNET_PREFIX}.{next_ip}" in used_ips:
-        next_ip += 1
-    return f"{SUBNET_PREFIX}.{next_ip}"
+def get_next_ip():
+    used = get_used_ips()
+    for i in range(2, 255):
+        if i not in used:
+            return f"{SUBNET_PREFIX}.{i}"
+    raise Exception("No IPs left in subnet")
 
-def generate_keys():
-    private_key = run("wg genkey")
-    public_key = run(f"echo {private_key} | wg pubkey")
-    return private_key, public_key
+def generate_keypair():
+    private = subprocess.check_output(["wg", "genkey"]).decode().strip()
+    public = subprocess.check_output(["wg", "pubkey"], input=private.encode()).decode().strip()
+    return private, public
 
-def ensure_server_config():
-    if not Path(WG_CONFIG).exists():
-        print("⚙️ Creating wg0.conf...")
-        server_priv, _ = get_server_keys()
-        interface = detect_outbound_interface()
+def get_server_public_key():
+    with open(f"{WG_DIR}/server_private.key") as f:
+        private = f.read().strip()
+    return subprocess.check_output(["wg", "pubkey"], input=private.encode()).decode().strip()
 
-        config = f"""[Interface]
-Address = 10.0.0.1/24
-SaveConfig = false
-PostUp = iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE; iptables -A FORWARD -i wg0 -o wg0 -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE; iptables -D FORWARD -i wg0 -o wg0 -j ACCEPT
-ListenPort = {SERVER_PORT}
-PrivateKey = {server_priv}
-"""
-        Path(WG_CONFIG).write_text(config)
-        print("✅ Server config created.")
+def generate_client(name):
+    print(f"🔧 Creating client: {name}")
+    client_private, client_public = generate_keypair()
+    client_ip = get_next_ip()
+    server_pub = get_server_public_key()
 
-def is_interface_up():
-    try:
-        output = run(f"sudo wg show {WG_INTERFACE}")
-        return "interface: " in output
-    except:
-        return False
-
-def keep_interface_up():
-    if not is_interface_up():
-        print(f"🚀 Bringing up {WG_INTERFACE}...")
-        subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
-    else:
-        print(f"🔄 Interface {WG_INTERFACE} already up.")
-
-    print("⏳ VPN is active. Press Ctrl+C to terminate and bring down the interface...")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n🛑 Caught termination signal.")
-
-def cleanup():
-    print("\n🧼 Cleaning up: Bringing interface down...")
-    subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE])
-    print("✅ Interface brought down. Exiting.")
-
-atexit.register(cleanup)
-
-# === Client Management ===
-def generate_client(client_name):
-    ensure_server_config()
-    print(f"🔧 Creating client: {client_name}")
-
-    priv_key, pub_key = generate_keys()
-    server_priv, server_pub = get_server_keys()
-    server_ip = get_public_ip()
-
-    used_ips = get_used_ips()
-    client_ip = get_next_ip(used_ips)
-
-    # Append to server config
-    peer_block = f"""
+    # Append peer to server config
+    peer_entry = f"""
 [Peer]
-# {client_name}
-PublicKey = {pub_key}
+# {name}
+PublicKey = {client_public}
 AllowedIPs = {client_ip}/32
 """
     with open(WG_CONFIG, "a") as f:
-        f.write(peer_block)
-
-    # Apply without restarting
-    print("🔄 Reloading WireGuard config dynamically...")
-    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, WG_CONFIG])
+        f.write(peer_entry)
 
     # Client config
-    client_config = f"""
-[Interface]
-PrivateKey = {priv_key}
+    client_config = f"""[Interface]
+PrivateKey = {client_private}
 Address = {client_ip}/32
-DNS = 1.1.1.1
+DNS = {DNS_SERVER}
 
 [Peer]
 PublicKey = {server_pub}
-Endpoint = {server_ip}:{SERVER_PORT}
+Endpoint = {get_public_ip()}:{SERVER_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
-    client_path = Path(CLIENT_DIR) / f"{client_name}.conf"
-    client_path.write_text(client_config.strip())
+    os.makedirs(CLIENT_DIR, exist_ok=True)
+    config_path = Path(CLIENT_DIR) / f"{name}.conf"
+    with open(config_path, "w") as f:
+        f.write(client_config)
 
-    print("📱 WireGuard Mobile QR Code:")
-    subprocess.run(f"qrencode -t ansiutf8 < {client_path}", shell=True)
+    subprocess.run(["sudo", "wg-quick", "save", WG_INTERFACE])
+    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, "/dev/stdin"], input=peer_entry.encode())
 
-    print(f"✅ Client {client_name} added with IP {client_ip}")
+    print("✅ Client configuration created.")
+    if which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ansiutf8"], input=client_config.encode())
+    else:
+        print("ℹ️ 'qrencode' not found, skipping QR code display.")
 
-def remove_client(client_name):
-    print(f"🧹 Removing {client_name} from server config...")
+def remove_client(name):
+    print(f"🧹 Removing client {name}...")
     with open(WG_CONFIG, "r") as f:
         lines = f.readlines()
-
     with open(WG_CONFIG, "w") as f:
-        skip = 0
+        skip = False
         for line in lines:
-            if line.strip() == f"# {client_name}":
-                skip = 3
-                continue
-            if skip > 0:
-                skip -= 1
-                continue
-            f.write(line)
+            if line.strip().startswith(f"# {name}"):
+                skip = True
+            elif skip and line.strip() == "":
+                skip = False
+            elif not skip:
+                f.write(line)
+    config_path = Path(CLIENT_DIR) / f"{name}.conf"
+    if config_path.exists():
+        config_path.unlink()
+    subprocess.run(["sudo", "wg-quick", "save", WG_INTERFACE])
+    subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE])
+    subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
+    print(f"✅ Client {name} removed.")
 
-    print("🔄 Reloading WireGuard config dynamically...")
-    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, WG_CONFIG])
+def list_clients():
+    print("📜 Current clients in config:")
+    with open(WG_CONFIG) as f:
+        for line in f:
+            if line.strip().startswith("#"):
+                print(" -", line.strip().lstrip("#").strip())
 
-    client_path = Path(CLIENT_DIR) / f"{client_name}.conf"
-    if client_path.exists():
-        client_path.unlink()
-        print(f"🗑 Deleted client config: {client_path}")
-
-    print(f"✅ Client {client_name} removed.")
-
-# === Interactive CLI ===
-def main():
-    ensure_server_config()
-    keep_interface_up()
-
-if __name__ == "__main__":
+def get_public_ip():
     try:
-        print("📡 WireGuard Client Manager")
-        print("===========================")
-        print("1. Add new client")
-        print("2. Remove existing client")
-        print("3. Exit")
-        choice = input("Select an option: ").strip()
+        return subprocess.check_output(["curl", "-s", "https://checkip.amazonaws.com"]).decode().strip()
+    except:
+        return "YOUR_PUBLIC_IP"
+
+def main():
+    initialize_server_config()
+    start_wireguard()
+
+    while True:
+        print("\nWhat would you like to do?")
+        print("1. Add a new client")
+        print("2. Remove an existing client")
+        print("3. List clients")
+        print("4. Exit")
+
+        choice = input("Enter choice [1-4]: ").strip()
 
         if choice == "1":
-            client_name = input("Enter client name: ").strip()
-            if not client_name:
-                print("❌ Client name is required.")
-                sys.exit(1)
-            generate_client(client_name)
-            main()
+            name = input("Enter client name: ").strip()
+            generate_client(name)
         elif choice == "2":
-            client_name = input("Enter client name to remove: ").strip()
-            if not client_name:
-                print("❌ Client name is required.")
-                sys.exit(1)
-            remove_client(client_name)
-            main()
+            name = input("Enter client name to remove: ").strip()
+            remove_client(name)
         elif choice == "3":
-            print("👋 Exiting.")
-            sys.exit(0)
+            list_clients()
+        elif choice == "4":
+            print("👋 Exiting. WireGuard remains up.")
+            break
         else:
-            print("❌ Invalid option.")
-            sys.exit(1)
+            print("❌ Invalid choice.")
 
-    except KeyboardInterrupt:
-        cleanup()
+if __name__ == "__main__":
+    main()
