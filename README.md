@@ -159,9 +159,7 @@ Enter client name: alice
 
 ## 🔐 Security Notes
 
-- Your Flask Web UI is protected with **Basic Authentication**.
-- Avoid leaving default passwords in production.
-- You can restrict external access using a firewall or reverse proxy (e.g., nginx).
+- The Flask Web UI is protected with **Basic Authentication**.
 
 ---
 
