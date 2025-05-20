@@ -1,14 +1,3 @@
-# Re-creating the full WireGuard management script based on user's requirements.
-# Features to include:
-# - Start WireGuard interface on script start
-# - Menu-based interaction for adding/removing/listing clients
-# - Generate keys
-# - Assign IPs
-# - Generate and show QR code
-# - Save config
-# - Keep interface up until user terminates
-# - No email feature (per user request)
-
 import os
 import subprocess
 import signal
@@ -25,6 +14,11 @@ SERVER_WG_IP = "10.0.0.1"
 SUBNET_PREFIX = "10.0.0"
 SERVER_PORT = 51820
 DNS_SERVER = "1.1.1.1"
+
+def check_requirements():
+    if not which("wg") or not which("wg-quick"):
+        print("❌ WireGuard tools (wg, wg-quick) are not installed. Please install them.")
+        sys.exit(1)
 
 def get_default_interface():
     result = subprocess.run(["ip", "route", "get", "8.8.8.8"], capture_output=True, text=True)
@@ -53,8 +47,8 @@ def initialize_server_config():
         config_content = f"""[Interface]
 Address = {SERVER_WG_IP}/24
 SaveConfig = false
-PostUp = iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE; iptables -A FORWARD -i {WG_INTERFACE} -o {WG_INTERFACE} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE; iptables -D FORWARD -i {WG_INTERFACE} -o {WG_INTERFACE} -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE; iptables -A FORWARD -i {WG_INTERFACE} -o {interface} -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE; iptables -D FORWARD -i {WG_INTERFACE} -o {interface} -j ACCEPT
 ListenPort = {SERVER_PORT}
 PrivateKey = {server_private_key}
 """
@@ -63,8 +57,12 @@ PrivateKey = {server_private_key}
         print("✅ Server base configuration created.")
 
 def start_wireguard():
-    subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
-    print(f"🚀 WireGuard interface {WG_INTERFACE} is now up.")
+    try:
+        subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE], check=True)
+        print(f"🚀 WireGuard interface {WG_INTERFACE} is now up.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to start WireGuard: {str(e)}")
+        sys.exit(1)
 
 def get_used_ips():
     used = set()
@@ -93,24 +91,33 @@ def get_server_public_key():
         private = f.read().strip()
     return subprocess.check_output(["wg", "pubkey"], input=private.encode()).decode().strip()
 
+def get_public_ip():
+    try:
+        return subprocess.check_output(["curl", "-s", "https://checkip.amazonaws.com"], timeout=5).decode().strip()
+    except:
+        try:
+            return subprocess.check_output(["curl", "-s", "https://api.ipify.org"], timeout=5).decode().strip()
+        except:
+            return "YOUR_PUBLIC_IP"
+
 def generate_client(name):
     print(f"🔧 Creating client: {name}")
-    client_private, client_public = generate_keypair()
-    client_ip = get_next_ip()
-    server_pub = get_server_public_key()
+    try:
+        client_private, client_public = generate_keypair()
+        client_ip = get_next_ip()
+        server_pub = get_server_public_key()
 
-    # Append peer to server config
-    peer_entry = f"""
+        peer_entry = f"""
 [Peer]
 # {name}
 PublicKey = {client_public}
 AllowedIPs = {client_ip}/32
 """
-    with open(WG_CONFIG, "a") as f:
-        f.write(peer_entry)
 
-    # Client config
-    client_config = f"""[Interface]
+        with open(WG_CONFIG, "a") as f:
+            f.write(peer_entry)
+
+        client_config = f"""[Interface]
 PrivateKey = {client_private}
 Address = {client_ip}/32
 DNS = {DNS_SERVER}
@@ -121,55 +128,76 @@ Endpoint = {get_public_ip()}:{SERVER_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 """
-    os.makedirs(CLIENT_DIR, exist_ok=True)
-    config_path = Path(CLIENT_DIR) / f"{name}.conf"
-    with open(config_path, "w") as f:
-        f.write(client_config)
 
-    subprocess.run(["sudo", "wg-quick", "save", WG_INTERFACE])
-    subprocess.run(["sudo", "wg", "addconf", WG_INTERFACE, "/dev/stdin"], input=peer_entry.encode())
+        os.makedirs(CLIENT_DIR, exist_ok=True)
+        config_path = Path(CLIENT_DIR) / f"{name}.conf"
+        with open(config_path, "w") as f:
+            f.write(client_config)
 
-    print("✅ Client configuration created.")
-    if which("qrencode"):
-        subprocess.run(["qrencode", "-t", "ansiutf8"], input=client_config.encode())
-    else:
-        print("ℹ️ 'qrencode' not found, skipping QR code display.")
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.write(peer_entry)
+            temp_file_path = temp_file.name
+
+        try:
+            subprocess.run(
+                ["sudo", "wg", "syncconf", WG_INTERFACE, temp_file_path],
+                check=True,
+            )
+            print("✅ Client configuration created and applied to server.")
+        finally:
+            os.unlink(temp_file_path)
+
+        if which("qrencode"):
+            subprocess.run(["qrencode", "-t", "ansiutf8"], input=client_config.encode())
+        else:
+            print("ℹ️ 'qrencode' not found, skipping QR code display.")
+
+    except Exception as e:
+        print(f"❌ Error creating client {name}: {str(e)}")
 
 def remove_client(name):
     print(f"🧹 Removing client {name}...")
-    with open(WG_CONFIG, "r") as f:
-        lines = f.readlines()
-    with open(WG_CONFIG, "w") as f:
-        skip = False
-        for line in lines:
-            if line.strip().startswith(f"# {name}"):
-                skip = True
-            elif skip and line.strip() == "":
-                skip = False
-            elif not skip:
-                f.write(line)
-    config_path = Path(CLIENT_DIR) / f"{name}.conf"
-    if config_path.exists():
-        config_path.unlink()
-    subprocess.run(["sudo", "wg-quick", "save", WG_INTERFACE])
-    subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE])
-    subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE])
-    print(f"✅ Client {name} removed.")
+    try:
+        with open(WG_CONFIG, "r") as f:
+            lines = f.readlines()
+
+        with open(WG_CONFIG, "w") as f:
+            skip = False
+            for line in lines:
+                if line.strip().startswith(f"# {name}"):
+                    skip = True
+                elif skip and line.strip() == "":
+                    skip = False
+                elif not skip:
+                    f.write(line)
+
+        config_path = Path(CLIENT_DIR) / f"{name}.conf"
+        if config_path.exists():
+            config_path.unlink()
+
+        subprocess.run(
+            ["sudo", "wg", "syncconf", WG_INTERFACE, WG_CONFIG],
+            check=True,
+        )
+        print(f"✅ Client {name} removed.")
+    except Exception as e:
+        print(f"❌ Error removing client {name}: {str(e)}")
 
 def list_clients():
     print("📜 Current clients in config:")
-    with open(WG_CONFIG) as f:
-        for line in f:
-            if line.strip().startswith("#"):
-                print(" -", line.strip().lstrip("#").strip())
-
-def get_public_ip():
     try:
-        return subprocess.check_output(["curl", "-s", "https://checkip.amazonaws.com"]).decode().strip()
-    except:
-        return "YOUR_PUBLIC_IP"
+        with open(WG_CONFIG) as f:
+            for line in f:
+                if line.strip().startswith("#"):
+                    print(" -", line.strip().lstrip("#").strip())
+    except Exception as e:
+        print(f"❌ Error listing clients: {str(e)}")
 
 def main():
+    if os.geteuid() != 0:
+        print("❌ This script must be run as root (use sudo).")
+        sys.exit(1)
+    check_requirements()
     initialize_server_config()
     start_wireguard()
 
@@ -184,10 +212,16 @@ def main():
 
         if choice == "1":
             name = input("Enter client name: ").strip()
-            generate_client(name)
+            if name:
+                generate_client(name)
+            else:
+                print("❌ Client name cannot be empty.")
         elif choice == "2":
             name = input("Enter client name to remove: ").strip()
-            remove_client(name)
+            if name:
+                remove_client(name)
+            else:
+                print("❌ Client name cannot be empty.")
         elif choice == "3":
             list_clients()
         elif choice == "4":
