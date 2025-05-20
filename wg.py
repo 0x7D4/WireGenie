@@ -35,14 +35,49 @@ def check_systemd_service():
 
 def validate_config():
     try:
-        # Use wg-quick to validate the configuration file syntax
+        # Check for empty [Peer] sections and normalize lines
+        with open(WG_CONFIG, "r") as f:
+            lines = f.readlines()
+        new_lines = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if line.strip().startswith("[Peer]"):
+                # Check if the next non-empty line is [Peer], [Interface], or end of file
+                j = i + 1
+                has_content = False
+                while j < len(lines) and not (lines[j].strip().startswith("[Peer]") or lines[j].strip().startswith("[Interface]")):
+                    if lines[j].strip() and not lines[j].strip().startswith("#"):
+                        has_content = True
+                        break
+                    j += 1
+                if not has_content:
+                    print(f"ℹ️ Removing empty [Peer] section at line {i + 1}")
+                    i = j
+                    continue
+            new_lines.append(line.rstrip() + "\n")  # Normalize line endings
+            i += 1
+
+        # Write cleaned configuration to a temporary file
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.writelines(new_lines)
+            temp_file_path = temp_file.name
+
+        # Validate the configuration
         result = subprocess.run(
-            ["wg-quick", "up", WG_CONFIG],
+            ["wg-quick", "up", temp_file_path],
             capture_output=True,
             text=True
         )
-        # If successful, immediately bring the interface down to avoid leaving it up
-        subprocess.run(["wg-quick", "down", WG_CONFIG], capture_output=True)
+        subprocess.run(["wg-quick", "down", temp_file_path], capture_output=True)
+        os.unlink(temp_file_path)
+
+        # Update wg0.conf if changes were made
+        if len(new_lines) != len(lines) or any(new_lines[i] != lines[i] for i in range(len(new_lines))):
+            with open(WG_CONFIG, "w") as f:
+                f.writelines(new_lines)
+            print(f"ℹ️ Updated {WG_CONFIG} to remove empty [Peer] sections and normalize formatting.")
+
         return True
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to validate {WG_CONFIG}: {e.stderr.strip() if e.stderr else str(e)}")
@@ -228,25 +263,89 @@ def remove_client(name):
         with open(WG_CONFIG, "r") as f:
             lines = f.readlines()
 
-        with open(WG_CONFIG, "w") as f:
-            skip = False
-            for line in lines:
-                if line.strip().startswith(f"# {name}"):
-                    skip = True
-                elif skip and line.strip() == "":
-                    skip = False
-                elif not skip:
-                    f.write(line)
+        new_lines = []
+        peer_lines = []
+        skip = False
+        found = False
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Check for the Peer block with the client name
+            if line.strip().startswith("[Peer]") and i + 1 < len(lines) and lines[i + 1].strip().startswith(f"# {name}"):
+                skip = True
+                found = True
+                print(f"ℹ️ Found client {name} at line {i + 1}, starting to skip [Peer] block...")
+                i += 1  # Skip the [Peer] line
+                # Skip all lines until the next [Peer], [Interface], or end of file
+                while i < len(lines) and not (lines[i].strip().startswith("[Peer]") or lines[i].strip().startswith("[Interface]")):
+                    print(f"ℹ️ Skipping line: {lines[i].strip()}")
+                    i += 1
+                continue
+            if not skip:
+                new_lines.append(line.rstrip() + "\n")  # Normalize line endings
+                if line.strip().startswith("[Peer]") or (line.strip() and not line.strip().startswith("[Interface]")):
+                    peer_lines.append(line.rstrip() + "\n")
+            i += 1
 
+        if not found:
+            print(f"❌ Client {name} not found in {WG_CONFIG}.")
+            return
+
+        # Write the updated configuration to a temporary file for validation
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            temp_file.writelines(new_lines)
+            temp_file_path = temp_file.name
+
+        # Validate the updated configuration
+        try:
+            result = subprocess.run(
+                ["wg-quick", "up", temp_file_path],
+                capture_output=True,
+                text=True
+            )
+            subprocess.run(["wg-quick", "down", temp_file_path], capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Updated configuration is invalid: {e.stderr.strip() if e.stderr else str(e)}")
+            os.unlink(temp_file_path)
+            raise Exception("Failed to validate configuration after removal")
+
+        # Write peer lines to a separate temporary file for syncconf
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as peer_temp_file:
+            peer_temp_file.writelines(peer_lines)
+            peer_temp_file_path = peer_temp_file.name
+
+        # Write the updated configuration to wg0.conf
+        with open(WG_CONFIG, "w") as f:
+            f.writelines(new_lines)
+        print(f"ℹ️ Updated {WG_CONFIG} written successfully.")
+        print(f"ℹ️ Updated {WG_CONFIG} contents:")
+        with open(WG_CONFIG, "r") as f:
+            print(f.read())
+
+        # Remove client configuration file
         config_path = Path(CLIENT_DIR) / f"{name}.conf"
         if config_path.exists():
             config_path.unlink()
+            print(f"ℹ️ Removed client config: {config_path}")
 
-        subprocess.run(
-            ["sudo", "wg", "syncconf", WG_INTERFACE, WG_CONFIG],
-            check=True,
-        )
-        print(f"✅ Client {name} removed.")
+        # Apply the updated peer configuration
+        try:
+            result = subprocess.run(
+                ["sudo", "wg", "syncconf", WG_INTERFACE, peer_temp_file_path],
+                capture_output=True,
+                text=True
+            )
+            print(f"✅ Client {name} removed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to apply updated configuration: {e.stderr.strip() if e.stderr else str(e)}")
+            # Restore original config
+            with open(WG_CONFIG, "w") as f:
+                f.writelines(lines)
+            print(f"ℹ️ Restored original {WG_CONFIG} due to syncconf failure.")
+            raise Exception("Failed to apply updated configuration")
+        finally:
+            os.unlink(temp_file_path)
+            os.unlink(peer_temp_file_path)
     except Exception as e:
         print(f"❌ Error removing client {name}: {str(e)}")
 
