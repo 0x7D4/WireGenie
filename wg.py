@@ -35,9 +35,20 @@ def check_systemd_service():
 
 def validate_config():
     try:
-        result = subprocess.run(["wg", "showconf", WG_INTERFACE], capture_output=True, text=True)
-        return result.returncode == 0
-    except:
+        # Use wg-quick to validate the configuration file syntax
+        result = subprocess.run(
+            ["wg-quick", "up", WG_CONFIG],
+            capture_output=True,
+            text=True
+        )
+        # If successful, immediately bring the interface down to avoid leaving it up
+        subprocess.run(["wg-quick", "down", WG_CONFIG], capture_output=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to validate {WG_CONFIG}: {e.stderr.strip() if e.stderr else str(e)}")
+        return False
+    except Exception as e:
+        print(f"❌ Error validating {WG_CONFIG}: {str(e)}")
         return False
 
 def get_default_interface():
@@ -94,7 +105,7 @@ def start_wireguard():
         subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE], check=True)
         print(f"🚀 WireGuard interface {WG_INTERFACE} is now up.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to start WireGuard: {str(e)}")
+        print(f"❌ Failed to start WireGuard: {e.stderr.strip() if e.stderr else str(e)}")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error checking WireGuard interface: {str(e)}")
@@ -110,7 +121,7 @@ def turn_off_wireguard():
         else:
             print(f"ℹ️ WireGuard interface {WG_INTERFACE} is already down.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Failed to bring down WireGuard: {str(e)}")
+        print(f"❌ Failed to bring down WireGuard: {e.stderr.strip() if e.stderr else str(e)}")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Error checking WireGuard interface: {str(e)}")
@@ -139,9 +150,13 @@ def generate_keypair():
     return private, public
 
 def get_server_public_key():
-    with open(f"{WG_DIR}/server_private.key") as f:
-        private = f.read().strip()
-    return subprocess.check_output(["wg", "pubkey"], input=private.encode()).decode().strip()
+    try:
+        with open(f"{WG_DIR}/server_private.key") as f:
+            private = f.read().strip()
+        return subprocess.check_output(["wg", "pubkey"], input=private.encode()).decode().strip()
+    except Exception as e:
+        print(f"❌ Error reading server private key: {str(e)}")
+        sys.exit(1)
 
 def get_public_ip():
     try:
