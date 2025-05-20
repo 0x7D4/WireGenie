@@ -3,6 +3,7 @@ import subprocess
 import signal
 import sys
 import tempfile
+import argparse
 from pathlib import Path
 from shutil import which
 
@@ -19,6 +20,25 @@ def check_requirements():
     if not which("wg") or not which("wg-quick"):
         print("❌ WireGuard tools (wg, wg-quick) are not installed. Please install them.")
         sys.exit(1)
+
+def check_systemd_service():
+    try:
+        result = subprocess.run(["systemctl", "is-active", f"wg-quick@{WG_INTERFACE}"], capture_output=True, text=True)
+        if result.stdout.strip() == "active":
+            print(f"⚠️ Warning: systemd service wg-quick@{WG_INTERFACE} is active. This may conflict with the script.")
+            print("Consider disabling the service with: sudo systemctl disable wg-quick@wg0")
+        result = subprocess.run(["systemctl", "is-enabled", f"wg-quick@{WG_INTERFACE}"], capture_output=True, text=True)
+        if result.stdout.strip() == "enabled":
+            print(f"ℹ️ Note: systemd service wg-quick@{WG_INTERFACE} is enabled and may start on boot.")
+    except Exception as e:
+        print(f"❌ Error checking systemd service status: {str(e)}")
+
+def validate_config():
+    try:
+        result = subprocess.run(["wg", "showconf", WG_INTERFACE], capture_output=True, text=True)
+        return result.returncode == 0
+    except:
+        return False
 
 def get_default_interface():
     result = subprocess.run(["ip", "route", "get", "8.8.8.8"], capture_output=True, text=True)
@@ -58,10 +78,42 @@ PrivateKey = {server_private_key}
 
 def start_wireguard():
     try:
+        # Check if wg0 interface is already up
+        result = subprocess.run(["wg", "show", WG_INTERFACE], capture_output=True, text=True)
+        if result.returncode == 0 and WG_INTERFACE in result.stdout:
+            print(f"ℹ️ WireGuard interface {WG_INTERFACE} is already up.")
+            return
+        # Validate configuration before starting
+        if not os.path.exists(WG_CONFIG):
+            print(f"❌ Configuration file {WG_CONFIG} does not exist.")
+            sys.exit(1)
+        if not validate_config():
+            print(f"❌ Invalid configuration in {WG_CONFIG}. Please check the file.")
+            sys.exit(1)
+        # Start the interface
         subprocess.run(["sudo", "wg-quick", "up", WG_INTERFACE], check=True)
         print(f"🚀 WireGuard interface {WG_INTERFACE} is now up.")
     except subprocess.CalledProcessError as e:
         print(f"❌ Failed to start WireGuard: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error checking WireGuard interface: {str(e)}")
+        sys.exit(1)
+
+def turn_off_wireguard():
+    try:
+        # Check if wg0 interface is up
+        result = subprocess.run(["wg", "show", WG_INTERFACE], capture_output=True, text=True)
+        if result.returncode == 0 and WG_INTERFACE in result.stdout:
+            subprocess.run(["sudo", "wg-quick", "down", WG_INTERFACE], check=True)
+            print(f"🛑 WireGuard interface {WG_INTERFACE} has been brought down.")
+        else:
+            print(f"ℹ️ WireGuard interface {WG_INTERFACE} is already down.")
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Failed to bring down WireGuard: {str(e)}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error checking WireGuard interface: {str(e)}")
         sys.exit(1)
 
 def get_used_ips():
@@ -193,11 +245,17 @@ def list_clients():
     except Exception as e:
         print(f"❌ Error listing clients: {str(e)}")
 
+def handle_shutdown(signum, frame):
+    print(f"\n🛑 Received signal {signum}. Bringing down {WG_INTERFACE}...")
+    turn_off_wireguard()
+    sys.exit(0)
+
 def main():
     if os.geteuid() != 0:
         print("❌ This script must be run as root (use sudo).")
         sys.exit(1)
     check_requirements()
+    check_systemd_service()
     initialize_server_config()
     start_wireguard()
 
@@ -225,10 +283,28 @@ def main():
         elif choice == "3":
             list_clients()
         elif choice == "4":
-            print("👋 Exiting. WireGuard remains up.")
+            print("👋 Exiting. Bringing down WireGuard interface...")
+            turn_off_wireguard()
             break
         else:
             print("❌ Invalid choice.")
 
 if __name__ == "__main__":
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="WireGuard Management Script")
+    parser.add_argument(
+        "--turn-off", "-t",
+        action="store_true",
+        help="Turn off the WireGuard interface and exit"
+    )
+    args = parser.parse_args()
+
+    # Handle turn-off argument
+    if args.turn_off:
+        turn_off_wireguard()
+        sys.exit(0)
+
+    # Register signal handlers and run main loop
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
     main()
