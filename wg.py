@@ -216,9 +216,11 @@ PublicKey = {client_public}
 AllowedIPs = {client_ip}/32
 """
 
+        # Append the new peer to wg0.conf
         with open(WG_CONFIG, "a") as f:
             f.write(peer_entry)
 
+        # Create client configuration
         client_config = f"""[Interface]
 PrivateKey = {client_private}
 Address = {client_ip}/32
@@ -236,18 +238,11 @@ PersistentKeepalive = 25
         with open(config_path, "w") as f:
             f.write(client_config)
 
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
-            temp_file.write(peer_entry)
-            temp_file_path = temp_file.name
-
-        try:
-            subprocess.run(
-                ["sudo", "wg", "syncconf", WG_INTERFACE, temp_file_path],
-                check=True,
-            )
-            print("✅ Client configuration created and applied to server.")
-        finally:
-            os.unlink(temp_file_path)
+        # Restart the WireGuard service
+        print(f"ℹ️ Restarting WireGuard service to apply new client {name}...")
+        turn_off_wireguard()
+        start_wireguard()
+        print(f"✅ Client {name} added and service restarted.")
 
         if which("qrencode"):
             subprocess.run(["qrencode", "-t", "ansiutf8"], input=client_config.encode())
@@ -256,6 +251,9 @@ PersistentKeepalive = 25
 
     except Exception as e:
         print(f"❌ Error creating client {name}: {str(e)}")
+        # Attempt to revert changes if configuration is invalid
+        turn_off_wireguard()
+        sys.exit(1)
 
 def remove_client(name):
     print(f"🧹 Removing client {name}...")
@@ -264,7 +262,6 @@ def remove_client(name):
             lines = f.readlines()
 
         new_lines = []
-        peer_lines = []
         skip = False
         found = False
         i = 0
@@ -283,8 +280,6 @@ def remove_client(name):
                 continue
             if not skip:
                 new_lines.append(line.rstrip() + "\n")  # Normalize line endings
-                if line.strip().startswith("[Peer]") or (line.strip() and not line.strip().startswith("[Interface]")):
-                    peer_lines.append(line.rstrip() + "\n")
             i += 1
 
         if not found:
@@ -309,11 +304,6 @@ def remove_client(name):
             os.unlink(temp_file_path)
             raise Exception("Failed to validate configuration after removal")
 
-        # Write peer lines to a separate temporary file for syncconf
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as peer_temp_file:
-            peer_temp_file.writelines(peer_lines)
-            peer_temp_file_path = peer_temp_file.name
-
         # Write the updated configuration to wg0.conf
         with open(WG_CONFIG, "w") as f:
             f.writelines(new_lines)
@@ -328,26 +318,18 @@ def remove_client(name):
             config_path.unlink()
             print(f"ℹ️ Removed client config: {config_path}")
 
-        # Apply the updated peer configuration
-        try:
-            result = subprocess.run(
-                ["sudo", "wg", "syncconf", WG_INTERFACE, peer_temp_file_path],
-                capture_output=True,
-                text=True
-            )
-            print(f"✅ Client {name} removed successfully.")
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Failed to apply updated configuration: {e.stderr.strip() if e.stderr else str(e)}")
-            # Restore original config
-            with open(WG_CONFIG, "w") as f:
-                f.writelines(lines)
-            print(f"ℹ️ Restored original {WG_CONFIG} due to syncconf failure.")
-            raise Exception("Failed to apply updated configuration")
-        finally:
-            os.unlink(temp_file_path)
-            os.unlink(peer_temp_file_path)
+        # Restart the WireGuard service
+        print(f"ℹ️ Restarting WireGuard service to apply client removal for {name}...")
+        turn_off_wireguard()
+        start_wireguard()
+        print(f"✅ Client {name} removed and service restarted.")
+
+        os.unlink(temp_file_path)
     except Exception as e:
         print(f"❌ Error removing client {name}: {str(e)}")
+        # Attempt to revert changes if configuration is invalid
+        turn_off_wireguard()
+        sys.exit(1)
 
 def list_clients():
     print("📜 Current clients in config:")
